@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Provably Fair Dice</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#5d6670; --line:#dde1e6; --accent:#2d6cdf; --win:#1a7f37; --lose:#c4314b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --card:#1a1e24; --fg:#e6e9ed; --muted:#9aa4ae; --line:#2c323a; --accent:#6c9cff; --win:#4ac26b; --lose:#ff6b81; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:24px 16px; display:grid; gap:16px; }
+  h1 { font-size:22px; margin:0; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  h2 { font-size:15px; margin:0 0 10px; color:var(--muted); font-weight:600; }
+  code { font:12px/1.4 ui-monospace, monospace; word-break:break-all; }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:4px 12px; margin:0; }
+  dt { color:var(--muted); }
+  dd { margin:0; min-width:0; }
+  .roll { font-size:56px; font-weight:700; text-align:center; font-variant-numeric:tabular-nums; }
+  .win { color:var(--win); } .lose { color:var(--lose); }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  input[type=range] { flex:1; min-width:160px; accent-color:var(--accent); }
+  input[type=text] { flex:1; min-width:160px; padding:8px; border:1px solid var(--line); border-radius:6px; background:transparent; color:inherit; font:inherit; }
+  button { padding:8px 18px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; }
+  .err { color:var(--lose); min-height:1.5em; margin:0; }
+  .scroll { max-height:240px; overflow:auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Provably Fair Dice</h1>
+
+  <section>
+    <h2>現在のシードペア（サーバーシードはハッシュのみ公開）</h2>
+    <dl>
+      <dt>Server seed hash</dt><dd><code id="hash"></code></dd>
+      <dt>Client seed</dt><dd><code id="client"></code></dd>
+      <dt>Next nonce</dt><dd><code id="nonce"></code></dd>
+    </dl>
+  </section>
+
+  <section>
+    <div id="roll" class="roll">--.--</div>
+    <div class="row">
+      <label for="target">出目が <strong id="targetLabel">50</strong> 未満なら勝ち</label>
+      <input id="target" type="range" min="2" max="98" value="50">
+      <button id="bet">ロール</button>
+    </div>
+    <p id="betErr" class="err" role="alert"></p>
+  </section>
+
+  <section>
+    <h2>このシードペアの履歴</h2>
+    <div class="scroll">
+      <table><thead><tr><th>nonce</th><th>target</th><th>roll</th><th>結果</th></tr></thead><tbody id="history"></tbody></table>
+    </div>
+  </section>
+
+  <section>
+    <h2>シードを切り替えて検証する</h2>
+    <p style="margin:0 0 10px">切り替えると現在のサーバーシードが公開され、それまでの履歴をブラウザ内（WebCrypto）で再計算して検証します。</p>
+    <div class="row">
+      <input id="newClient" type="text" maxlength="64" placeholder="新しい client seed（1〜64 文字、空白と : 以外の ASCII）" aria-label="新しい client seed">
+      <button id="rotate">切り替え</button>
+    </div>
+    <p id="rotateErr" class="err" role="alert"></p>
+    <div id="verify" hidden>
+      <dl>
+        <dt>公開された server seed</dt><dd><code id="vSeed"></code></dd>
+        <dt>SHA-256 の一致</dt><dd id="vHash"></dd>
+      </dl>
+      <div class="scroll" style="margin-top:10px">
+        <table><thead><tr><th>nonce</th><th>記録された roll</th><th>再計算した roll</th><th>検証</th></tr></thead><tbody id="vRows"></tbody></table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+// ── サーバーから独立した検証器（src/engine.ts と src/games/dice.ts の計算をブラウザ側で再実装） ──
+const sha256Hex = async (s) => hex(await crypto.subtle.digest('SHA-256', enc.encode(s)));
+const diceRoll = async (serverSeed, clientSeed, nonce) => {
+  const key = await crypto.subtle.importKey('raw', enc.encode(serverSeed), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const digest = await crypto.subtle.sign('HMAC', key, enc.encode(`${clientSeed}:${nonce}:0`));
+  const float = new DataView(digest).getUint32(0) / 2 ** 32;
+  return Math.floor(float * 10001) / 100;
+};
+
+const api = async (method, path, body) => {
+  const res = await fetch(path, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error ?? res.statusText);
+  return json;
+};
+
+const cell = (text, cls) => { const td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; return td; };
+const row = (...cells) => { const tr = document.createElement('tr'); tr.append(...cells); return tr; };
+const fmt = (n) => n.toFixed(2);
+
+const renderPair = (pair) => {
+  $('hash').textContent = pair.serverSeedHash;
+  $('client').textContent = pair.clientSeed;
+  $('nonce').textContent = pair.nonce;
+};
+const addHistory = (r) => {
+  $('history').prepend(row(cell(r.nonce), cell(r.params.target), cell(fmt(r.outcome.roll)),
+    cell(r.outcome.win ? '勝ち' : '負け', r.outcome.win ? 'win' : 'lose')));
+};
+
+$('target').addEventListener('input', (e) => { $('targetLabel').textContent = e.target.value; });
+
+$('bet').addEventListener('click', async () => {
+  $('bet').disabled = true; $('betErr').textContent = '';
+  try {
+    const { record, pair } = await api('POST', '/api/bet', { target: Number($('target').value) });
+    $('roll').textContent = fmt(record.outcome.roll);
+    $('roll').className = `roll ${record.outcome.win ? 'win' : 'lose'}`;
+    renderPair(pair); addHistory(record);
+  } catch (e) { $('betErr').textContent = e.message; }
+  finally { $('bet').disabled = false; }
+});
+
+$('rotate').addEventListener('click', async () => {
+  $('rotate').disabled = true; $('rotateErr').textContent = '';
+  try {
+    const { revealed, revealedBets: bets, pair } = await api('POST', '/api/rotate', { clientSeed: $('newClient').value });
+    renderPair(pair); $('history').replaceChildren(); $('roll').textContent = '--.--'; $('roll').className = 'roll';
+
+    const hashOk = (await sha256Hex(revealed.serverSeed)) === revealed.serverSeedHash;
+    $('vSeed').textContent = revealed.serverSeed;
+    $('vHash').textContent = hashOk ? '✓ 一致（事前に公開されたハッシュと同じシード）' : '✗ 不一致（不正の可能性）';
+    $('vHash').className = hashOk ? 'win' : 'lose';
+    const rows = [];
+    for (const b of bets) {
+      const roll = await diceRoll(revealed.serverSeed, b.clientSeed, b.nonce);
+      const ok = hashOk && b.serverSeedHash === revealed.serverSeedHash && roll === b.outcome.roll && (roll < b.params.target) === b.outcome.win;
+      rows.push(row(cell(b.nonce), cell(fmt(b.outcome.roll)), cell(fmt(roll)), cell(ok ? '✓' : '✗', ok ? 'win' : 'lose')));
+    }
+    $('vRows').replaceChildren(...rows);
+    $('verify').hidden = false;
+  } catch (e) { $('rotateErr').textContent = e.message; }
+  finally { $('rotate').disabled = false; }
+});
+
+const { pair, bets } = await api('GET', '/api/state');
+renderPair(pair); bets.forEach(addHistory);
+</script>
+</body>
+</html>
